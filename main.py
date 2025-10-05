@@ -1,12 +1,13 @@
 import os
-import logging
 import re
+import sys
+import logging
+
 import requests
 import openai
 from flask import Flask, request, jsonify
 
 # ——— Logging ———
-import sys
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -17,70 +18,96 @@ logger = logging.getLogger(__name__)
 # ——— Env Vars ———
 BOT_TOKEN         = os.environ["TELEGRAM_BOT_TOKEN"]
 WEBHOOK_SECRET    = os.environ["TELEGRAM_WEBHOOK_SECRET"]
-RENDER_DOMAIN     = os.environ["REPLIT_DOMAINS"]  # yourapp.onrender.com
+RENDER_DOMAIN     = os.environ["REPLIT_DOMAINS"]       # e.g. translatepal.onrender.com
 OPENAI_API_KEY    = os.environ["OPENAI_API_KEY"]
-DEFAULT_LANGUAGE  = "fa"
+PORT              = int(os.getenv("PORT", 10000))
 
 if not re.match(r'^[A-Za-z0-9_]{1,256}$', WEBHOOK_SECRET):
     raise ValueError("Invalid TELEGRAM_WEBHOOK_SECRET format")
 
 openai.api_key = OPENAI_API_KEY
 
+# ——— In‐memory user language state ———
+# Maps chat_id -> ISO code or language name, e.g. "es", "fa", "French", etc.
+USER_LANGUAGE = {}
+
 app = Flask(__name__)
 
-# ——— Translation Logic ———
-def translate_text(text: str, src_lang: str, target_lang: str) -> str:
-    # Build the system prompt
-    if src_lang.lower() == "en":
-        prompt = f"You are a professional translator. Translate the following English into {target_lang} naturally:\n\n\"\"\"\n{text}\n\"\"\""
-    else:
-        prompt = f"You are a professional translator. Translate the following {src_lang} into English naturally:\n\n\"\"\"\n{text}\n\"\"\""
-    resp = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role":"system", "content": prompt}
-        ]
-    )
-    return resp.choices[0].message.content.strip()
+# ——— Endpoint to set/change a user’s target language ———
+@app.route("/set_language", methods=["POST"])
+def set_language():
+    j = request.get_json(force=True)
+    chat_id = j.get("chat_id")
+    lang    = j.get("language")
+    if not chat_id or not lang:
+        return jsonify({"error":"chat_id and language required"}), 400
+    USER_LANGUAGE[int(chat_id)] = lang
+    return jsonify({"status":"ok"}), 200
 
-# ——— Webhook Endpoint ———
+# ——— Core Webhook ———
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # 1) Verify secret header
-    token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    # 1) Verify Telegram secret header
+    token = request.headers.get("X-Telegram-Bot-Api-Secret-Token","")
     if token != WEBHOOK_SECRET:
-        logger.warning("Invalid secret token")
+        logger.warning("Invalid webhook secret")
         return jsonify({"error":"forbidden"}), 403
 
     update = request.get_json(force=True)
     logger.info(f"Incoming update: {update}")
 
-    msg = update.get("message")
+    msg = update.get("message") or update.get("edited_message")
     if not msg or "text" not in msg:
         return jsonify({"status":"ignored"}), 200
 
-    chat_id  = msg["chat"]["id"]
-    text     = msg["text"]
-    src_lang = msg["from"].get("language_code","en")
+    chat_id       = msg["chat"]["id"]
+    text          = msg["text"]
+    src_lang_code = msg.get("from", {}).get("language_code","en").lower()
 
-    # 2) Determine target
-    if src_lang.lower() == "en":
-        target = DEFAULT_LANGUAGE
+    # 2) Determine target language
+    # If user previously set a language, use that. Otherwise default to English or Farsi.
+    if src_lang_code == "en":
+        target = USER_LANGUAGE.get(chat_id, "fa")   # default to Farsi if none chosen
     else:
         target = "English"
 
-    # 3) Translate
+    # 3) Build the strict system prompt exactly as you specified
+    system_prompt = """
+You are a world-class translator.
+
+When a user sends a message in any language other than English, translate it into fluent, understandable English.
+
+When a user sends a message in English, translate it into the user’s selected language, or the most-recently used language if they’ve chosen one.
+
+Always ensure the translations are natural, culturally adapted, and not word-for-word.
+
+Never add any explanations or extra comments—only return the translated text.
+""".strip()
+
+    # 4) Call OpenAI with correct v1.x API
     try:
-        translation = translate_text(text, src_lang, target)
+        chat = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role":"system", "content": system_prompt},
+                {"role":"user",   "content": text}
+            ]
+        )
+        translation = chat.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"OpenAI error: {e}")
-        translation = "❌ Translation error."
+        translation = "❌ Sorry, I couldn’t translate that."
 
-    # 4) Send back
-    send_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": translation}
-    r = requests.post(send_url, json=payload)
-    logger.info(f"Replied with {r.status_code}: {translation[:30]!r}")
+    # 5) Reply to Telegram
+    resp = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id":chat_id, "text":translation}
+    )
+    if not resp.ok:
+        logger.error(f"sendMessage failed: {resp.status_code} {resp.text}")
+    else:
+        logger.info(f"Replied to {chat_id}")
+
     return jsonify({"status":"ok"}), 200
 
 # ——— Health Check ———
@@ -89,5 +116,5 @@ def health():
     return jsonify({"status":"ok"}), 200
 
 if __name__ == "__main__":
-    # Just for local debug; on Render, gunicorn runs it.
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT",5000)))
+    # Local testing
+    app.run(host="0.0.0.0", port=PORT, debug=False)
