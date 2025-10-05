@@ -23,12 +23,12 @@ logger = logging.getLogger(__name__)
 # ——— Environment Variables ———
 BOT_TOKEN       = os.environ["TELEGRAM_BOT_TOKEN"]
 WEBHOOK_SECRET  = os.environ["TELEGRAM_WEBHOOK_SECRET"]
+RENDER_DOMAIN   = os.environ["REPLIT_DOMAINS"]    # e.g. translatepal.onrender.com
 OPENAI_API_KEY  = os.environ["OPENAI_API_KEY"]
 PORT            = int(os.getenv("PORT", 10000))
 
-# Validate secret format
 if not re.match(r'^[A-Za-z0-9_]{1,256}$', WEBHOOK_SECRET):
-    raise ValueError("Invalid TELEGRAM_WEBHOOK_SECRET")
+    raise ValueError("Invalid TELEGRAM_WEBHOOK_SECRET format")
 
 openai.api_key = OPENAI_API_KEY
 app = Flask(__name__)
@@ -39,7 +39,7 @@ if os.path.exists(PREFS_FILE):
     with open(PREFS_FILE, "r") as f:
         USER_LANGUAGE = json.load(f)
 else:
-    USER_LANGUAGE = {}  # chat_id (str) → language code
+    USER_LANGUAGE = {}  # chat_id (str) -> language code
 
 def save_prefs():
     with open(PREFS_FILE, "w") as f:
@@ -73,7 +73,7 @@ def send_message(chat_id, text, reply_markup=None):
         logger.error(f"sendMessage error {r.status_code}: {r.text}")
 
 def answer_callback_query(callback_query_id: str, text: str):
-    """Show a Telegram toast banner for callback queries."""
+    """Show a toast banner at top of chat."""
     requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
         json={
@@ -89,24 +89,24 @@ def is_english(text: str) -> bool:
     except Exception:
         return False
 
-# ——— Webhook ———
+# ——— Flask Webhook ———
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # 1) Verify secret header
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token","") != WEBHOOK_SECRET:
-        return jsonify({"error":"forbidden"}), 403
+    # 1) Verify Telegram secret header
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
+        return jsonify({"error": "forbidden"}), 403
 
     update = request.get_json(force=True)
     logger.info(f"Incoming update: {update}")
 
-    # 2) Callback query → explicit /language selection
+    # 2) Handle inline-button language-selection callbacks
     if "callback_query" in update:
         cq = update["callback_query"]
-        data = cq.get("data","")
+        data = cq.get("data", "")
         chat_id = str(cq["message"]["chat"]["id"])
         cq_id   = cq["id"]
         if data.startswith("lang|"):
-            code = data.split("|",1)[1]
+            code = data.split("|", 1)[1]
             if code in SUPPORTED_LANGUAGES:
                 USER_LANGUAGE[chat_id] = code
                 save_prefs()
@@ -114,39 +114,43 @@ def webhook():
                 answer_callback_query(cq_id, f"Selected: {label}")
             else:
                 answer_callback_query(cq_id, "Unknown language.")
-        return jsonify({"status":"ok"}), 200
+        return jsonify({"status": "ok"}), 200
 
-    # 3) Normal messages
-    msg = update.get("message",{})
-    text = msg.get("text","")
-    chat = msg.get("chat",{})
-    chat_id = str(chat.get("id",""))
+    # 3) Handle ordinary messages
+    msg = update.get("message", {})
+    text = msg.get("text", "")
+    chat = msg.get("chat", {})
+    chat_id = str(chat.get("id", ""))
     if not text or not chat_id:
-        return jsonify({"status":"ignored"}), 200
+        return jsonify({"status": "ignored"}), 200
 
-    # 4) /language command → show menu
+    # 4) /language command → show inline menu
     if text.strip().lower().startswith("/language"):
         keyboard, row = [], []
-        for code,(label,_) in SUPPORTED_LANGUAGES.items():
-            row.append({"text":label,"callback_data":f"lang|{code}"})
-            if len(row)==2:
+        for code, (label, _) in SUPPORTED_LANGUAGES.items():
+            row.append({"text": label, "callback_data": f"lang|{code}"})
+            if len(row) == 2:
                 keyboard.append(row)
-                row=[]
-        if row: keyboard.append(row)
-        send_message(chat_id, "Please select a language:", {"inline_keyboard":keyboard})
-        return jsonify({"status":"ok"}), 200
+                row = []
+        if row:
+            keyboard.append(row)
+        reply_markup = {"inline_keyboard": keyboard}
+        send_message(chat_id, "Please select a language:", reply_markup)
+        return jsonify({"status": "ok"}), 200
 
-    # 5) Decide direction
+    # 5) Decide translation direction
     english = is_english(text)
-    logger.info(f"is_english={english} text={text!r}")
+    logger.info(f"is_english: {english} for text: {text}")
 
     if english:
-        # English → user’s selected language
+        # English → selected language
         if chat_id not in USER_LANGUAGE:
-            send_message(chat_id,
-                "❗ Please send me a non-English message first, or use /language to choose a language."
+            send_message(
+                chat_id,
+                "❗ Please send me a non-English message first, "
+                "or use /language to select a target language."
             )
-            return jsonify({"status":"ok"}), 200
+            return jsonify({"status": "ok"}), 200
         target_code = USER_LANGUAGE[chat_id]
         target_name = SUPPORTED_LANGUAGES[target_code][1]
         direction = f"When a user sends a message in English, translate it into {target_name}."
@@ -156,26 +160,29 @@ def webhook():
             "When a user sends a message in any language other than English, "
             "translate it into fluent, understandable English."
         )
-        # Auto-switch user’s language for future English→X
+        # Auto-select this language for future translations
         try:
             detected = detect(text)
             if detected in SUPPORTED_LANGUAGES:
                 USER_LANGUAGE[chat_id] = detected
                 save_prefs()
                 label = SUPPORTED_LANGUAGES[detected][0]
-                send_message(chat_id, f"🔄 Language auto-switched to {label}")
+                # show a toast for auto-switch
+                answer_callback_query("", f"🔄 Auto-switched to {label}")
         except Exception:
             pass
 
-    # 6) Strict system prompt
+    # 6) Build strict system prompt
     system_prompt = f"""
 You are a world-class translator.
 
 {direction}
 
-Always produce a translation. Never return the original text, even a single word.
-Ensure translations are natural, culturally adapted, and never word-for-word.
-Never add explanations or extra comments—only return the translated text.
+Always ensure the translations are natural, culturally adapted, and not word-for-word.
+Under no circumstances should you return the original text; always provide the correct translation,
+even for single words or short phrases.
+
+Never add any explanations or extra comments—only return the translated text.
 """.strip()
     logger.info(f"System prompt: {system_prompt}")
 
@@ -184,24 +191,24 @@ Never add explanations or extra comments—only return the translated text.
         resp = openai.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role":"system","content":system_prompt},
-                {"role":"user","content":text}
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": text}
             ]
         )
         translation = resp.choices[0].message.content.strip()
-        logger.info(f"OpenAI→ {translation}")
+        logger.info(f"OpenAI returned: {translation}")
     except Exception as e:
         logger.error(f"OpenAI error: {e}")
         translation = "❌ Sorry, I couldn’t translate that."
 
-    # 8) Send back translation
+    # 8) Reply
     send_message(chat_id, translation)
-    return jsonify({"status":"ok"}), 200
+    return jsonify({"status": "ok"}), 200
 
-# Health check
+# ——— Health Check ———
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status":"ok"}), 200
+    return jsonify({"status": "ok"}), 200
 
-if __name__=="__main__":
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)
