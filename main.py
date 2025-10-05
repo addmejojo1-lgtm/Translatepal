@@ -15,14 +15,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ——— Env Vars ———
+# ——— Environment Variables ———
 BOT_TOKEN         = os.environ["TELEGRAM_BOT_TOKEN"]
 WEBHOOK_SECRET    = os.environ["TELEGRAM_WEBHOOK_SECRET"]
 RENDER_DOMAIN     = os.environ["REPLIT_DOMAINS"]       # e.g. translatepal.onrender.com
 OPENAI_API_KEY    = os.environ["OPENAI_API_KEY"]
 PORT              = int(os.getenv("PORT", 10000))
 
-# Validate secret token format
+# Validate webhook secret format
 if not re.match(r'^[A-Za-z0-9_]{1,256}$', WEBHOOK_SECRET):
     raise ValueError("Invalid TELEGRAM_WEBHOOK_SECRET format")
 
@@ -30,20 +30,19 @@ openai.api_key = OPENAI_API_KEY
 
 app = Flask(__name__)
 
-# ——— In‐memory user prefs ———
-# chat_id → language code (e.g. "fa","es","de")
+# ——— In-memory user prefs ———
+# chat_id → language code (e.g. "fa","es","de","it")
 USER_LANGUAGE = {}
-# Supported options:
 SUPPORTED_LANGUAGES = {
-    "fa": ("🇮🇷 Persian (Farsi)","fa"),
-    "es": ("🇪🇸 Spanish","es"),
-    "fr": ("🇫🇷 French","fr"),
-    "de": ("🇩🇪 German","de"),
-    "it": ("🇮🇹 Italian","it"),
-    "tr": ("🇹🇷 Turkish","tr"),
-    "ru": ("🇷🇺 Russian","ru"),
-    "ar": ("🇸🇦 Arabic","ar"),
-    "zh": ("🇨🇳 Chinese","zh"),
+    "fa": ("🇮🇷 Persian (Farsi)", "Persian"),
+    "es": ("🇪🇸 Spanish",         "Spanish"),
+    "fr": ("🇫🇷 French",          "French"),
+    "de": ("🇩🇪 German",          "German"),
+    "it": ("🇮🇹 Italian",         "Italian"),
+    "tr": ("🇹🇷 Turkish",         "Turkish"),
+    "ru": ("🇷🇺 Russian",         "Russian"),
+    "ar": ("🇸🇦 Arabic",          "Arabic"),
+    "zh": ("🇨🇳 Chinese",         "Chinese"),
 }
 
 # ——— Helpers ———
@@ -62,31 +61,18 @@ def answer_callback(query_id: str):
         json={"callback_query_id": query_id}
     )
 
-def translate_text(text: str, src_lang: str, target_lang: str) -> str:
-    # Strict system prompt as you specified
-    system_prompt = """
-You are a world-class translator.
+# ——— Translation ———
 
-When a user sends a message in any language other than English, translate it into fluent, understandable English.
+def translate_text(text: str) -> str:
+    """
+    Build a strict, dynamic system prompt based on USER_LANGUAGE and source language.
+    """
+    # Extract language codes
+    # Note: In webhook we pass src_lang and chat_id globally for prompt
+    # but here we reconstruct inside webhook itself.
+    raise RuntimeError("translate_text should not be called directly")
 
-When a user sends a message in English, translate it into the user’s selected language, or the most-recently used language if they’ve chosen one.
-
-Always ensure the translations are natural, culturally adapted, and not word-for-word.
-
-Never add any explanations or extra comments—only return the translated text.
-""".strip()
-    # Build messages
-    messages = [
-        {"role":"system","content":system_prompt},
-        {"role":"user","content":text}
-    ]
-    resp = openai.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=messages
-    )
-    return resp.choices[0].message.content.strip()
-
-# ——— Webhook ———
+# ——— Webhook Endpoint ———
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -97,60 +83,86 @@ def webhook():
     update = request.get_json(force=True)
     logger.info(f"Update: {update}")
 
-    # 2) handle callback_query (button presses)
+    # 2) handle callback_query for language selection
     if "callback_query" in update:
         cq = update["callback_query"]
         data = cq.get("data","")
         chat_id = cq["message"]["chat"]["id"]
-        # expected format: "lang|<code>"
         if data.startswith("lang|"):
             code = data.split("|",1)[1]
             if code in SUPPORTED_LANGUAGES:
                 USER_LANGUAGE[chat_id] = code
-                send_message(chat_id, f"Language set to {SUPPORTED_LANGUAGES[code][0]}")
+                label = SUPPORTED_LANGUAGES[code][0]
+                send_message(chat_id, f"Language set to {label}")
             else:
-                send_message(chat_id, "Unknown language selection.")
+                send_message(chat_id, "Unknown language.")
         answer_callback(cq["id"])
         return jsonify({"status":"ok"}), 200
 
     # 3) handle normal messages
     msg = update.get("message",{})
     text = msg.get("text","")
-    chat_id = msg.get("chat",{}).get("id")
+    chat = msg.get("chat",{})
+    chat_id = chat.get("id")
     if not text or not chat_id:
         return jsonify({"status":"ignored"}), 200
 
-    # 4) /language command: show inline menu
+    # 4) /language command → show inline keyboard
     if text.strip().lower().startswith("/language"):
-        # build inline keyboard
         keyboard = []
         row = []
         for code,(label,_) in SUPPORTED_LANGUAGES.items():
             row.append({"text": label, "callback_data": f"lang|{code}"})
-            if len(row)==2:
-                keyboard.append(row); row=[]
-        if row: keyboard.append(row)
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
         reply_markup = {"inline_keyboard": keyboard}
         send_message(chat_id, "Please select a language:", reply_markup)
         return jsonify({"status":"ok"}), 200
 
     # 5) translation flow
     src_lang = msg.get("from",{}).get("language_code","en").lower()
-    # determine target
+
+    # Determine prompt direction
     if src_lang.startswith("en"):
-        target = USER_LANGUAGE.get(chat_id, "fa")
+        code = USER_LANGUAGE.get(chat_id, "fa")
+        lang_name = SUPPORTED_LANGUAGES.get(code, ("", "Farsi"))[1]
+        direction = f"When a user sends a message in English, translate it into {lang_name}."
     else:
-        target = "en"
+        direction = "When a user sends a message in any language other than English, translate it into fluent, understandable English."
+
+    # Build strict system prompt
+    system_prompt = f"""
+You are a world-class translator.
+
+{direction}
+
+Always ensure the translations are natural, culturally adapted, and not word-for-word.
+
+Never add any explanations or extra comments—only return the translated text.
+""".strip()
+
+    # Call OpenAI v1.x API
     try:
-        result = translate_text(text, src_lang, target)
+        resp = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role":"system", "content": system_prompt},
+                {"role":"user",   "content": text}
+            ]
+        )
+        translation = resp.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"OpenAI error: {e}")
-        result = "❌ Sorry, I couldn’t translate that."
+        translation = "❌ Sorry, I couldn’t translate that."
 
-    send_message(chat_id, result)
+    send_message(chat_id, translation)
     return jsonify({"status":"ok"}), 200
 
-# ——— Health ———
+# ——— Health Endpoint ———
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status":"ok"}), 200
