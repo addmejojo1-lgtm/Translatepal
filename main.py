@@ -61,27 +61,28 @@ SUPPORTED_LANGUAGES = {
 
 # ——— Helpers ———
 def send_message(chat_id, text, reply_markup=None):
+    logger.info(f"send_message → {chat_id}: {text}")
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload)
+    r = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json=payload
+    )
     if not r.ok:
         logger.error(f"sendMessage error {r.status_code}: {r.text}")
 
-def answer_callback(query_id):
+def answer_callback_query(callback_query_id: str, text: str):
+    """Show a toast banner at top of chat."""
     requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
-        json={"callback_query_id": query_id}
+        json={"callback_query_id": callback_query_id, "text": text, "show_alert": False}
     )
 
 def is_english(text: str) -> bool:
-    """
-    Uses langdetect to decide if text is English.
-    """
     try:
         return detect(text) == "en"
     except Exception:
-        # If detection fails, assume non-English to avoid misclassification
         return False
 
 # ——— Flask Webhook ———
@@ -94,15 +95,118 @@ def webhook():
     update = request.get_json(force=True)
     logger.info(f"Incoming update: {update}")
 
-    # 2) Handle language-selection callbacks
+    # 2) Handle inline-button language-selection callbacks
     if "callback_query" in update:
         cq = update["callback_query"]
         data = cq.get("data", "")
         chat_id = str(cq["message"]["chat"]["id"])
+        cq_id   = cq["id"]
         if data.startswith("lang|"):
             code = data.split("|", 1)[1]
             if code in SUPPORTED_LANGUAGES:
                 USER_LANGUAGE[chat_id] = code
+                save_prefs()
+                label = SUPPORTED_LANGUAGES[code][0]
+                # show toast
+                answer_callback_query(cq_id, f"Selected: {label}")
+            else:
+                answer_callback_query(cq_id, "Unknown language.")
+        return jsonify({"status": "ok"}), 200
+
+    # 3) Handle ordinary messages
+    msg = update.get("message", {})
+    text = msg.get("text", "")
+    chat = msg.get("chat", {})
+    chat_id = str(chat.get("id"))
+    if not text or not chat_id:
+        return jsonify({"status": "ignored"}), 200
+
+    # 4) /language command → show inline menu
+    if text.strip().lower().startswith("/language"):
+        keyboard, row = [], []
+        for code, (label, _) in SUPPORTED_LANGUAGES.items():
+            row.append({"text": label, "callback_data": f"lang|{code}"})
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+        reply_markup = {"inline_keyboard": keyboard}
+        send_message(chat_id, "Please select a language:", reply_markup)
+        return jsonify({"status": "ok"}), 200
+
+    # 5) Decide translation direction
+    english = is_english(text)
+    logger.info(f"is_english: {english} for text: {text}")
+
+    if english:
+        # English → selected language
+        if chat_id not in USER_LANGUAGE:
+            send_message(
+                chat_id,
+                "❗ Please send me a non-English message first, or use /language to select a target language."
+            )
+            return jsonify({"status": "ok"}), 200
+        target_code = USER_LANGUAGE[chat_id]
+        target_name = SUPPORTED_LANGUAGES[target_code][1]
+        direction = f"When a user sends a message in English, translate it into {target_name}."
+    else:
+        # Non-English → English
+        direction = (
+            "When a user sends a message in any language other than English, "
+            "translate it into fluent, understandable English."
+        )
+        # Auto-select for future
+        try:
+            detected = detect(text)
+            if detected in SUPPORTED_LANGUAGES:
+                USER_LANGUAGE[chat_id] = detected
+                save_prefs()
+                label = SUPPORTED_LANGUAGES[detected][0]
+                # notify via toast-style message
+                send_message(chat_id, f"🔄 Language auto-switched to {label}")
+        except Exception:
+            pass
+
+    # 6) Build strict system prompt
+    system_prompt = f"""
+You are a world-class translator.
+
+{direction}
+
+Always ensure the translations are natural, culturally adapted, and not word-for-word.  
+Under no circumstances should you return the original text; always provide the correct translation, even for single words or short phrases.
+
+Never add any explanations or extra comments—only return the translated text.
+""".strip()
+    logger.info(f"System prompt: {system_prompt}")
+
+    # 7) Call OpenAI
+    try:
+        resp = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": text}
+            ]
+        )
+        translation = resp.choices[0].message.content.strip()
+        logger.info(f"OpenAI returned: {translation}")
+    except Exception as e:
+        logger.error(f"OpenAI error: {e}")
+        translation = "❌ Sorry, I couldn’t translate that."
+
+    # 8) Reply
+    send_message(chat_id, translation)
+    return jsonify({"status": "ok"}), 200
+
+# ——— Health Check ———
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=PORT, debug=False)                USER_LANGUAGE[chat_id] = code
                 save_prefs()
                 label = SUPPORTED_LANGUAGES[code][0]
                 send_message(chat_id, f"Language set to {label}")
