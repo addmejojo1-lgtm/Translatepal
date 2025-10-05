@@ -22,19 +22,19 @@ RENDER_DOMAIN     = os.environ["REPLIT_DOMAINS"]       # e.g. translatepal.onren
 OPENAI_API_KEY    = os.environ["OPENAI_API_KEY"]
 PORT              = int(os.getenv("PORT", 10000))
 
-# Validate webhook secret format
 if not re.match(r'^[A-Za-z0-9_]{1,256}$', WEBHOOK_SECRET):
     raise ValueError("Invalid TELEGRAM_WEBHOOK_SECRET format")
 
 openai.api_key = OPENAI_API_KEY
-
 app = Flask(__name__)
 
 # ——— In-memory user prefs ———
-# chat_id → language code (e.g. "fa","es","de","it")
+# chat_id → language code (e.g. "es","de","it", etc.)
 USER_LANGUAGE = {}
+
 SUPPORTED_LANGUAGES = {
     "fa": ("🇮🇷 Persian (Farsi)", "Persian"),
+    "pt": ("🇵🇹 Portuguese",      "Portuguese"),
     "es": ("🇪🇸 Spanish",         "Spanish"),
     "fr": ("🇫🇷 French",          "French"),
     "de": ("🇩🇪 German",          "German"),
@@ -46,44 +46,31 @@ SUPPORTED_LANGUAGES = {
 }
 
 # ——— Helpers ———
-
-def send_message(chat_id: int, text: str, reply_markup: dict = None):
+def send_message(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload)
     if not r.ok:
-        logger.error(f"sendMessage error {r.status_code}: {r.text}")
+        logger.error(f"sendMessage failed {r.status_code}: {r.text}")
 
-def answer_callback(query_id: str):
+def answer_callback(query_id):
     requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
         json={"callback_query_id": query_id}
     )
 
-# ——— Translation ———
-
-def translate_text(text: str) -> str:
-    """
-    Build a strict, dynamic system prompt based on USER_LANGUAGE and source language.
-    """
-    # Extract language codes
-    # Note: In webhook we pass src_lang and chat_id globally for prompt
-    # but here we reconstruct inside webhook itself.
-    raise RuntimeError("translate_text should not be called directly")
-
-# ——— Webhook Endpoint ———
-
+# ——— Webhook ———
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # 1) verify secret
+    # 1) Verify Telegram secret header
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token","") != WEBHOOK_SECRET:
         return jsonify({"error":"forbidden"}), 403
 
     update = request.get_json(force=True)
     logger.info(f"Update: {update}")
 
-    # 2) handle callback_query for language selection
+    # 2) Handle callback_query for /language menu
     if "callback_query" in update:
         cq = update["callback_query"]
         data = cq.get("data","")
@@ -99,7 +86,7 @@ def webhook():
         answer_callback(cq["id"])
         return jsonify({"status":"ok"}), 200
 
-    # 3) handle normal messages
+    # 3) Handle normal messages
     msg = update.get("message",{})
     text = msg.get("text","")
     chat = msg.get("chat",{})
@@ -107,33 +94,38 @@ def webhook():
     if not text or not chat_id:
         return jsonify({"status":"ignored"}), 200
 
-    # 4) /language command → show inline keyboard
+    # 4) /language command → show inline menu
     if text.strip().lower().startswith("/language"):
-        keyboard = []
-        row = []
+        keyboard, row = [], []
         for code,(label,_) in SUPPORTED_LANGUAGES.items():
             row.append({"text": label, "callback_data": f"lang|{code}"})
-            if len(row) == 2:
-                keyboard.append(row)
-                row = []
-        if row:
-            keyboard.append(row)
+            if len(row)==2:
+                keyboard.append(row); row=[]
+        if row: keyboard.append(row)
         reply_markup = {"inline_keyboard": keyboard}
         send_message(chat_id, "Please select a language:", reply_markup)
         return jsonify({"status":"ok"}), 200
 
-    # 5) translation flow
+    # 5) Decide translation direction
     src_lang = msg.get("from",{}).get("language_code","en").lower()
 
-    # Determine prompt direction
     if src_lang.startswith("en"):
-        code = USER_LANGUAGE.get(chat_id, "fa")
-        lang_name = SUPPORTED_LANGUAGES.get(code, ("", "Farsi"))[1]
-        direction = f"When a user sends a message in English, translate it into {lang_name}."
+        # English→X: must have previously selected or auto-selected via last non-English
+        if chat_id not in USER_LANGUAGE:
+            send_message(chat_id,
+                "❗ Please send me a message in your target language first, or use /language to select one.")
+            return jsonify({"status":"ok"}), 200
+        target_code = USER_LANGUAGE[chat_id]
+        target_name = SUPPORTED_LANGUAGES[target_code][1]
+        direction = f"When a user sends a message in English, translate it into {target_name}."
     else:
-        direction = "When a user sends a message in any language other than English, translate it into fluent, understandable English."
+        # Non-English→English: always translate to English
+        # AND auto-select this src_lang as future target
+        direction = ("When a user sends a message in any language other than English, "
+                     "translate it into fluent, understandable English.")
+        # remember their language
+        USER_LANGUAGE[chat_id] = src_lang[:2]  # e.g. "it", "es", "fa"
 
-    # Build strict system prompt
     system_prompt = f"""
 You are a world-class translator.
 
@@ -144,7 +136,7 @@ Always ensure the translations are natural, culturally adapted, and not word-for
 Never add any explanations or extra comments—only return the translated text.
 """.strip()
 
-    # Call OpenAI v1.x API
+    # 6) Call OpenAI
     try:
         resp = openai.chat.completions.create(
             model="gpt-3.5-turbo",
@@ -158,11 +150,11 @@ Never add any explanations or extra comments—only return the translated text.
         logger.error(f"OpenAI error: {e}")
         translation = "❌ Sorry, I couldn’t translate that."
 
+    # 7) Reply
     send_message(chat_id, translation)
     return jsonify({"status":"ok"}), 200
 
-# ——— Health Endpoint ———
-
+# ——— Health Check ———
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status":"ok"}), 200
