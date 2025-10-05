@@ -21,17 +21,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ——— Environment Variables ———
-BOT_TOKEN         = os.environ["TELEGRAM_BOT_TOKEN"]
-WEBHOOK_SECRET    = os.environ["TELEGRAM_WEBHOOK_SECRET"]
-RENDER_DOMAIN     = os.environ["REPLIT_DOMAINS"]
-OPENAI_API_KEY    = os.environ["OPENAI_API_KEY"]
-PORT              = int(os.getenv("PORT", 10000))
+BOT_TOKEN       = os.environ["TELEGRAM_BOT_TOKEN"]
+WEBHOOK_SECRET  = os.environ["TELEGRAM_WEBHOOK_SECRET"]
+RENDER_DOMAIN   = os.environ["REPLIT_DOMAINS"]    # e.g. translatepal.onrender.com
+OPENAI_API_KEY  = os.environ["OPENAI_API_KEY"]
+PORT            = int(os.getenv("PORT", 10000))
 
 if not re.match(r'^[A-Za-z0-9_]{1,256}$', WEBHOOK_SECRET):
     raise ValueError("Invalid TELEGRAM_WEBHOOK_SECRET format")
 
 openai.api_key = OPENAI_API_KEY
-
 app = Flask(__name__)
 
 # ——— Persistence Layer ———
@@ -40,13 +39,13 @@ if os.path.exists(PREFS_FILE):
     with open(PREFS_FILE, "r") as f:
         USER_LANGUAGE = json.load(f)
 else:
-    USER_LANGUAGE = {}
+    USER_LANGUAGE = {}  # chat_id (str) -> language code
 
 def save_prefs():
     with open(PREFS_FILE, "w") as f:
         json.dump(USER_LANGUAGE, f)
 
-# ——— Language Configuration ———
+# ——— Supported Languages ———
 SUPPORTED_LANGUAGES = {
     "fa": ("🇮🇷 Persian (Farsi)", "Persian"),
     "pt": ("🇵🇹 Portuguese",      "Portuguese"),
@@ -76,76 +75,92 @@ def answer_callback(query_id):
     )
 
 def is_english(text: str) -> bool:
+    """
+    Uses langdetect to decide if text is English.
+    """
     try:
         return detect(text) == "en"
     except Exception:
-        return bool(re.fullmatch(r"[A-Za-z0-9\s\.\,\!\?\'\"\-\(\)]+", text))
+        # If detection fails, assume non-English to avoid misclassification
+        return False
 
-# ——— Webhook Endpoint ———
+# ——— Flask Webhook ———
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token","") != WEBHOOK_SECRET:
-        return jsonify({"error":"forbidden"}), 403
+    # 1) Verify Telegram secret header
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
+        return jsonify({"error": "forbidden"}), 403
 
     update = request.get_json(force=True)
     logger.info(f"Incoming update: {update}")
 
-    # Language-selection callback
+    # 2) Handle language-selection callbacks
     if "callback_query" in update:
         cq = update["callback_query"]
-        code = cq["data"].split("|",1)[1]
-        chat_id = cq["message"]["chat"]["id"]
-        if code in SUPPORTED_LANGUAGES:
-            USER_LANGUAGE[str(chat_id)] = code
-            save_prefs()
-            send_message(chat_id, f"Language set to {SUPPORTED_LANGUAGES[code][0]}")
-        else:
-            send_message(chat_id, "Unknown language.")
+        data = cq.get("data", "")
+        chat_id = str(cq["message"]["chat"]["id"])
+        if data.startswith("lang|"):
+            code = data.split("|", 1)[1]
+            if code in SUPPORTED_LANGUAGES:
+                USER_LANGUAGE[chat_id] = code
+                save_prefs()
+                label = SUPPORTED_LANGUAGES[code][0]
+                send_message(chat_id, f"Language set to {label}")
+            else:
+                send_message(chat_id, "Unknown language.")
         answer_callback(cq["id"])
-        return jsonify({"status":"ok"}), 200
+        return jsonify({"status": "ok"}), 200
 
-    # Normal message
-    msg = update.get("message",{})
-    text = msg.get("text","")
-    chat_id = msg.get("chat",{}).get("id")
+    # 3) Handle ordinary messages
+    msg = update.get("message", {})
+    text = msg.get("text", "")
+    chat = msg.get("chat", {})
+    chat_id = str(chat.get("id"))
     if not text or not chat_id:
-        return jsonify({"status":"ignored"}), 200
+        return jsonify({"status": "ignored"}), 200
 
-    # /language command: show menu
+    # 4) /language command → show inline menu
     if text.strip().lower().startswith("/language"):
         keyboard, row = [], []
-        for code,(label,_) in SUPPORTED_LANGUAGES.items():
+        for code, (label, _) in SUPPORTED_LANGUAGES.items():
             row.append({"text": label, "callback_data": f"lang|{code}"})
-            if len(row)==2:
-                keyboard.append(row); row=[]
-        if row: keyboard.append(row)
-        send_message(chat_id, "Please select a language:", {"inline_keyboard": keyboard})
-        return jsonify({"status":"ok"}), 200
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+        reply_markup = {"inline_keyboard": keyboard}
+        send_message(chat_id, "Please select a language:", reply_markup)
+        return jsonify({"status": "ok"}), 200
 
-    # Decide direction
+    # 5) Decide translation direction
     if is_english(text):
-        prefs = USER_LANGUAGE.get(str(chat_id))
-        if not prefs:
+        # English → selected language
+        if chat_id not in USER_LANGUAGE:
             send_message(
                 chat_id,
-                "❗ Please send me a non-English message first, or use /language to select one."
+                "❗ Please send me a non-English message first, or use /language to select a target language."
             )
-            return jsonify({"status":"ok"}), 200
-        target_name = SUPPORTED_LANGUAGES[prefs][1]
+            return jsonify({"status": "ok"}), 200
+        target_code = USER_LANGUAGE[chat_id]
+        target_name = SUPPORTED_LANGUAGES[target_code][1]
         direction = f"When a user sends a message in English, translate it into {target_name}."
     else:
-        direction = ("When a user sends a message in any language other than English, "
-                     "translate it into fluent, understandable English.")
-        # Auto-select this language for future
+        # Non-English → English
+        direction = (
+            "When a user sends a message in any language other than English, "
+            "translate it into fluent, understandable English."
+        )
+        # Auto-select this language for future English→X translations
         try:
             detected = detect(text)
             if detected in SUPPORTED_LANGUAGES:
-                USER_LANGUAGE[str(chat_id)] = detected
+                USER_LANGUAGE[chat_id] = detected
                 save_prefs()
-        except:
+        except Exception:
             pass
 
-    # Build prompt
+    # 6) Build strict system prompt
     system_prompt = f"""
 You are a world-class translator.
 
@@ -156,13 +171,13 @@ Always ensure the translations are natural, culturally adapted, and not word-for
 Never add any explanations or extra comments—only return the translated text.
 """.strip()
 
-    # Call OpenAI
+    # 7) Call OpenAI
     try:
         resp = openai.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role":"system",  "content": system_prompt},
-                {"role":"user",    "content": text}
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": text}
             ]
         )
         translation = resp.choices[0].message.content.strip()
@@ -170,13 +185,14 @@ Never add any explanations or extra comments—only return the translated text.
         logger.error(f"OpenAI error: {e}")
         translation = "❌ Sorry, I couldn’t translate that."
 
+    # 8) Reply
     send_message(chat_id, translation)
-    return jsonify({"status":"ok"}), 200
+    return jsonify({"status": "ok"}), 200
 
 # ——— Health Check ———
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status":"ok"}), 200
+    return jsonify({"status": "ok"}), 200
 
-if __name__=="__main__":
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)
